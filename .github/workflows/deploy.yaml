@@ -1,0 +1,154 @@
+name: Deploy Movie Picture Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "starter/backend/**"
+      - "starter/frontend/**"
+      - ".github/workflows/deploy.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: cluster
+
+jobs:
+  deploy:
+    name: Build and Deploy to EKS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set ECR registry
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "ECR_REGISTRY=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_ENV"
+
+      - name: Log in to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login \
+                --username AWS \
+                --password-stdin "$ECR_REGISTRY"
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION"
+
+      - name: Build and push backend image
+        run: |
+          docker build \
+            -t "$ECR_REGISTRY/backend:$GITHUB_SHA" \
+            ./starter/backend
+
+          docker push "$ECR_REGISTRY/backend:$GITHUB_SHA"
+
+      - name: Deploy backend
+        run: |
+          kubectl apply -f starter/backend/k8s/service.yaml
+          kubectl apply -f starter/backend/k8s/deployment.yaml
+
+          kubectl set image deployment/backend \
+            backend="$ECR_REGISTRY/backend:$GITHUB_SHA"
+
+          kubectl rollout status deployment/backend --timeout=5m
+
+      - name: Wait for backend LoadBalancer
+        run: |
+          for attempt in $(seq 1 60); do
+            BACKEND_HOST=$(kubectl get service backend \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+            if [ -n "$BACKEND_HOST" ]; then
+              break
+            fi
+
+            echo "Waiting for backend LoadBalancer ($attempt/60)..."
+            sleep 10
+          done
+
+          if [ -z "$BACKEND_HOST" ]; then
+            kubectl describe service backend
+            echo "Backend LoadBalancer hostname was not assigned."
+            exit 1
+          fi
+
+          echo "BACKEND_URL=http://${BACKEND_HOST}" >> "$GITHUB_ENV"
+          echo "Backend URL: http://${BACKEND_HOST}"
+
+      - name: Verify backend API
+        run: |
+          curl --fail --silent --show-error \
+            --retry 30 --retry-delay 10 --retry-connrefused \
+            "$BACKEND_URL/movies" \
+            -o /dev/null
+
+          echo "Backend API is responding."
+
+      - name: Build and push frontend image
+        run: |
+          docker build \
+            --build-arg REACT_APP_MOVIE_API_URL="$BACKEND_URL" \
+            -t "$ECR_REGISTRY/frontend:$GITHUB_SHA" \
+            ./starter/frontend
+
+          docker push "$ECR_REGISTRY/frontend:$GITHUB_SHA"
+
+      - name: Deploy frontend
+        run: |
+          kubectl apply -f starter/frontend/k8s/service.yaml
+          kubectl apply -f starter/frontend/k8s/deployment.yaml
+
+          kubectl set image deployment/frontend \
+            frontend="$ECR_REGISTRY/frontend:$GITHUB_SHA"
+
+          kubectl rollout status deployment/frontend --timeout=5m
+
+      - name: Wait for frontend LoadBalancer
+        run: |
+          for attempt in $(seq 1 60); do
+            FRONTEND_HOST=$(kubectl get service frontend \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+            if [ -n "$FRONTEND_HOST" ]; then
+              break
+            fi
+
+            echo "Waiting for frontend LoadBalancer ($attempt/60)..."
+            sleep 10
+          done
+
+          if [ -z "$FRONTEND_HOST" ]; then
+            kubectl describe service frontend
+            echo "Frontend LoadBalancer hostname was not assigned."
+            exit 1
+          fi
+
+          echo "FRONTEND_URL=http://${FRONTEND_HOST}" >> "$GITHUB_ENV"
+          echo "Frontend URL: http://${FRONTEND_HOST}"
+
+      - name: Verify frontend
+        run: |
+          curl --fail --silent --show-error \
+            --retry 30 --retry-delay 10 --retry-connrefused \
+            "$FRONTEND_URL/" \
+            -o /dev/null
+
+          echo "Frontend is responding."
+          echo "Application URL: $FRONTEND_URL"
